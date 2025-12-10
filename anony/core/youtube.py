@@ -15,53 +15,136 @@ from typing import Optional, Union
 from pyrogram import enums, types
 from py_yt import Playlist, VideosSearch
 
-from anony import logger
+from anony import app
 from anony.helpers import Track, utils
 
 
 class YouTube:
     def __init__(self):
         self.base = "https://www.youtube.com/watch?v="
+        self.listbase = "https://youtube.com/playlist?list="
+        self.regex = r"(https?://)?(www\.|m\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})"
         self.cookies = []
         self.checked = False
-        self.warned = False
-        self.regex = re.compile(
-            r"(https?://)?(www\.|m\.|music\.)?"
-            r"(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
-            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
-        )
+        self._cached_cookie = None
+        self._info_cache = {}
 
     def get_cookies(self):
         if not self.checked:
-            for file in os.listdir("anony/cookies"):
-                if file.endswith(".txt"):
-                    self.cookies.append(file)
+            folder_path = os.path.join(os.getcwd(), "../cookies")
+            txt_files = glob.glob(os.path.join(folder_path, '*.txt'))
+            if txt_files:
+                self.cookies = [os.path.basename(f) for f in txt_files]
             self.checked = True
         if not self.cookies:
-            if not self.warned:
-                self.warned = True
-                logger.warning("Cookies are missing; downloads might fail.")
             return None
-        return f"anony/cookies/{random.choice(self.cookies)}"
+        chosen_file = random.choice(self.cookies)
+        log_filename = os.path.join(os.getcwd(), "../cookies", "logs.csv")
+        with open(log_filename, 'a') as file:
+            file.write(f'Chosen File: {chosen_file}\n')
+        self._cached_cookie = f"../cookies/{chosen_file}"
+        return self._cached_cookie
 
-    async def save_cookies(self, urls: list[str]) -> None:
-        logger.info("Saving cookies from urls...")
+    def cookie_txt_file(self):
+        if self._cached_cookie:
+            return self._cached_cookie
+        return self.get_cookies()
+
+    def extract_video_info(self, link: str) -> dict:
+        if link in self._info_cache:
+            return self._info_cache[link]
+        ytdl_opts = {
+            "quiet": True,
+            "cookiefile": self.cookie_txt_file(),
+        }
+        with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+            info = ydl.extract_info(link, download=False)
+        self._info_cache[link] = info
+        return info
+
+    def parse_tg_link(self, link: str) -> Tuple[Optional[str], Optional[int]]:
+        """Telegram link se chat username aur message ID extract karta hai"""
+        parsed = urlparse(link)
+        path = parsed.path.strip('/')
+        parts = path.split('/')
+        
+        if len(parts) >= 2:
+            return str(parts[0]), int(parts[1])
+            
+        return None, None
+
+    async def fetch_song(self, query: str, streamtype: str):
+        api_url = "https://eytapi02-28af26f8c000.herokuapp.com/try"
+        status_url = "https://eytapi02-28af26f8c000.herokuapp.com/status"
+
+        vid = "true" if streamtype.lower() == "video" else "false"
+        params = {"query": query, "vid": vid}
+
         async with aiohttp.ClientSession() as session:
-            for url in urls:
-                path = f"anony/cookies/cookie{random.randint(10000, 99999)}.txt"
-                link = url.replace("me/", "me/raw/")
-                async with session.get(link) as resp:
-                    resp.raise_for_status()
-                    with open(path, "wb") as fw:
-                        fw.write(await resp.read())
-        logger.info("Cookies saved.")
+            async with session.get(api_url, params=params) as response:
+                data = await response.json()
+
+            if "link" in data:
+                return data
+
+            job_id = data.get("job_id")
+            if not job_id:
+                return {"error": "No job id received"}
+
+            for _ in range(600):
+                await asyncio.sleep(2)
+                async with session.get(status_url, params={"id": job_id}) as r:
+                    status_data = await r.json()
+
+                if status_data.get("status") == "done":
+                    return {"link": status_data.get("link")}
+
+                if status_data.get("status") == "failed":
+                    return {"error": "Download failed"}
+
+            return {"error": "Timeout waiting for song"}
+
+    async def download_tg_media(self, tg_link: str) -> Optional[str]:
+        
+        c_username, message_id = self.parse_tg_link(tg_link)
+        if not c_username or not message_id:
+            return None
+
+        if c_username.startswith("@"):
+            c_username = c_username[1:]
+
+        try:
+            msg = await app.get_messages(c_username, message_id)
+            if not msg or not msg.media:
+                return None
+
+            filex = msg.audio or msg.video or msg.document
+            if not filex:
+                return None
+
+            if msg.audio:
+                file_name = f"{filex.file_unique_id}.{filex.file_name.split('.')[-1] if filex.file_name else 'ogg'}"
+            elif msg.video or msg.document:
+                file_name = f"{filex.file_unique_id}.{filex.file_name.split('.')[-1] if filex.file_name else 'mp4'}"
+            else:
+                return None
+
+            fname = os.path.join("downloads", file_name)
+            if os.path.exists(fname):
+                return fname
+
+            await app.download_media(msg, fname)
+            return fname
+
+        except Exception as e:
+            logging.error(f"Error downloading TG media: {e}")
+            return None
 
     def valid(self, url: str) -> bool:
         return bool(re.match(self.regex, url))
 
     def url(self, message_1: types.Message) -> Union[str, None]:
         messages = [message_1]
-        link = None
         if message_1.reply_to_message:
             messages.append(message_1.reply_to_message)
 
@@ -71,17 +154,13 @@ class YouTube:
             if message.entities:
                 for entity in message.entities:
                     if entity.type == enums.MessageEntityType.URL:
-                        link = text[entity.offset : entity.offset + entity.length]
-                        break
+                        return text[entity.offset : entity.offset + entity.length]
 
             if message.caption_entities:
                 for entity in message.caption_entities:
                     if entity.type == enums.MessageEntityType.TEXT_LINK:
-                        link = entity.url
-                        break
+                        return entity.url
 
-        if link:
-            return link.split("&si")[0].split("?si")[0]
         return None
 
     async def search(self, query: str, m_id: int, video: bool = False) -> Track | None:
@@ -103,29 +182,84 @@ class YouTube:
             )
         return None
 
-    async def playlist(self, limit: int, user: str, url: str, video: bool) -> list[Track | None]:
-        tracks = []
-        try:
-            plist = await Playlist.get(url)
-            for data in plist["videos"][:limit]:
-                track = Track(
-                    id=data.get("id"),
-                    channel_name=data.get("channel", {}).get("name", ""),
-                    duration=data.get("duration"),
-                    duration_sec=utils.to_seconds(data.get("duration")),
-                    title=data.get("title")[:25],
-                    thumbnail=data.get("thumbnails")[-1].get("url").split("?")[0],
-                    url=data.get("link").split("&list=")[0],
-                    user=user,
-                    view_count="",
-                    video=video,
-                )
-                tracks.append(track)
-        except:
-            pass
-        return tracks
+    async def details(self, link: str, videoid: Union[bool, str] = None) -> Tuple[str, str, int, str, str]:
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=1)
+        search_result = (await results.next())["result"][0]
+        title = search_result["title"]
+        duration_str = search_result["duration"]
+        thumbnail = search_result["thumbnails"][0]["url"].split("?")[0]
+        vidid = search_result["id"]
+        duration_sec = int(utils.to_seconds(duration_str)) if duration_str else 0
+        return title, duration_str, duration_sec, thumbnail, vidid
 
-    async def download(self, video_id: str, video: bool = False) -> Optional[str]:
+    async def title(self, link: str, videoid: Union[bool, str] = None) -> str:
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=1)
+        return (await results.next())["result"][0]["title"]
+
+    async def duration(self, link: str, videoid: Union[bool, str] = None) -> str:
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=1)
+        return (await results.next())["result"][0]["duration"]
+
+    async def thumbnail(self, link: str, videoid: Union[bool, str] = None) -> str:
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=1)
+        return (await results.next())["result"][0]["thumbnails"][0]["url"].split("?")[0]
+
+    async def track(self, link: str, videoid: Union[bool, str] = None) -> Tuple[dict, str]:
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=1)
+        search_result = (await results.next())["result"][0]
+        track_details = {
+            "title": search_result["title"],
+            "link": search_result["link"],
+            "vidid": search_result["id"],
+            "duration_min": search_result["duration"],
+            "thumb": search_result["thumbnails"][0]["url"].split("?")[0],
+        }
+        return track_details, search_result["id"]
+
+    async def slider(self, link: str, query_type: int, videoid: Union[bool, str] = None) -> Tuple[str, str, str, str]:
+        if videoid:
+            link = self.base + link
+        if "&" in link:
+            link = link.split("&")[0]
+        results = VideosSearch(link, limit=10)
+        entries = (await results.next()).get("result")
+        selected = entries[query_type]
+        return selected["title"], selected["duration"], selected["thumbnails"][0]["url"].split("?")[0], selected["id"]
+
+    async def get_download_link(self, query: str, video_stream: bool = False) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+        streamtype = "video" if video_stream else "audio"
+        song_data = await self.fetch_song(query, streamtype)
+
+        if not song_data or "error" in song_data or "link" not in song_data:
+            error_msg = song_data.get("error", "Failed to process query")
+            return None, None, error_msg
+
+        song_url = song_data["link"]
+        c_username, message_id = self.parse_tg_link(song_url)
+        
+        return c_username, message_id, None
+
+    async def download(self, video_id: str, video: bool = False, title: Optional[str] = None) -> Optional[str]:
         url = self.base + video_id
         ext = "mp4" if video else "webm"
         filename = f"downloads/{video_id}.{ext}"
@@ -133,7 +267,19 @@ class YouTube:
         if Path(filename).exists():
             return filename
 
-        cookie = self.get_cookies()
+        # Try API first
+        query = title or (await self.title(video_id, True))
+        streamtype = "video" if video else "audio"
+        song_data = await self.fetch_song(query, streamtype)
+        if song_data and "link" in song_data and not song_data.get("error"):
+            tg_link = song_data["link"]
+            if tg_link.startswith("https://t.me/"):
+                local_path = await self.download_tg_media(tg_link)
+                if local_path:
+                    return local_path
+            return tg_link  # Direct stream URL if not TG
+
+        # Fallback to direct yt_dlp
         base_opts = {
             "outtmpl": "downloads/%(id)s.%(ext)s",
             "quiet": True,
@@ -141,8 +287,9 @@ class YouTube:
             "geo_bypass": True,
             "no_warnings": True,
             "overwrites": False,
+            "ignoreerrors": True,
             "nocheckcertificate": True,
-            "cookiefile": cookie,
+            "cookiefile": self.cookie_txt_file(),
         }
 
         if video:
@@ -159,15 +306,7 @@ class YouTube:
 
         def _download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                try:
-                    ydl.download([url])
-                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
-                    if cookie in self.cookies:
-                        self.cookies.remove(cookie)
-                    return None
-                except Exception as ex:
-                    logger.error("Download failed: %s", ex)
-                    return None
+                ydl.download([url])
             return filename
 
         return await asyncio.to_thread(_download)
