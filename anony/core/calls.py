@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 # This file is part of AnonXMusic
 
-
+import os
 from ntgcalls import ConnectionNotFound, TelegramServerError
 from pyrogram.errors import MessageIdInvalid
 from pyrogram.types import InputMediaPhoto, Message
@@ -30,6 +30,10 @@ class TgCall(PyTgCalls):
     async def stop(self, chat_id: int) -> None:
         client = await db.get_assistant(chat_id)
         try:
+            current_media = queue.get_current(chat_id)
+            if current_media and current_media.file_path:
+                self._delete_file(current_media.file_path)
+
             queue.clear(chat_id)
             await db.remove_call(chat_id)
         except:
@@ -40,6 +44,12 @@ class TgCall(PyTgCalls):
         except:
             pass
 
+    def _delete_file(self, file_path: str) -> None:
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except:
+            pass
 
     async def play_media(
         self,
@@ -129,6 +139,11 @@ class TgCall(PyTgCalls):
     async def play_next(self, chat_id: int) -> None:
         if not await db.get_call(chat_id):
             return
+
+        current_media = queue.get_current(chat_id)
+
+        if current_media and current_media.file_path:
+            self._delete_file(current_media.file_path)
 
         media = queue.get_next(chat_id)
         try:
